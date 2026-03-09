@@ -7,13 +7,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 import pandas as pd
 import numpy as np
+import os
+import uvicorn
 
 app = FastAPI()
 
 # Allow frontend access (important for Vercel)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # you can restrict this later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,7 +31,7 @@ class TextInput(BaseModel):
     text: str
 
 
-# Load model and dataset on startup
+# Load model + data at startup
 @app.on_event("startup")
 def load_resources():
     global model, questions, embeddings
@@ -42,8 +44,8 @@ def load_resources():
 
     questions = df["question"].tolist()
 
-    print("Generating embeddings...")
-    embeddings = model.encode(questions)
+    print("Loading embeddings...")
+    embeddings = np.load("embeddings.npy")
 
     print("Backend ready!")
 
@@ -54,7 +56,7 @@ def home():
     return {"message": "VeriText API is running"}
 
 
-# Main plagiarism check endpoint
+# Plagiarism detection endpoint
 @app.post("/api/plagiarism-check")
 def plagiarism_check(input: TextInput):
 
@@ -77,3 +79,9 @@ def plagiarism_check(input: TextInput):
     return {
         "results": results
     }
+
+
+# Render deployment fix (bind to dynamic PORT)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
