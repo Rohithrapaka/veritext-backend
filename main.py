@@ -1,70 +1,79 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-import pandas as pd
 
-# Initialize FastAPI
+import pandas as pd
+import numpy as np
+
 app = FastAPI()
 
-# CORS (IMPORTANT for frontend requests)
+# Allow frontend access (important for Vercel)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all origins for development
+    allow_origins=["*"],   # you can restrict this later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-print("Loading Sentence-BERT model...")
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-print("Loading dataset...")
-df = pd.read_csv("dataset.csv")
-dataset_texts = df["text"].tolist()
-
-print("Loading embeddings...")
-dataset_embeddings = np.load("embeddings.npy")
-
-print("API Ready 🚀")
+# Globals
+model = None
+questions = []
+embeddings = None
 
 
-# Request model
-class InputText(BaseModel):
+class TextInput(BaseModel):
     text: str
 
 
-# Root endpoint (optional but helpful)
+# Load model and dataset on startup
+@app.on_event("startup")
+def load_resources():
+    global model, questions, embeddings
+
+    print("Loading Sentence-BERT model...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("Loading dataset...")
+    df = pd.read_csv("clean_questions.csv")
+
+    questions = df["question"].tolist()
+
+    print("Generating embeddings...")
+    embeddings = model.encode(questions)
+
+    print("Backend ready!")
+
+
+# Root route (for Render health check)
 @app.get("/")
 def home():
     return {"message": "VeriText API is running"}
 
 
-# Plagiarism check endpoint
+# Main plagiarism check endpoint
 @app.post("/api/plagiarism-check")
-def check_plagiarism(data: InputText):
+def plagiarism_check(input: TextInput):
 
-    input_text = data.text
+    global model, embeddings, questions
 
-    # Convert input text to embedding
-    input_embedding = model.encode([input_text])
+    query_embedding = model.encode([input.text])
 
-    # Compute similarity
-    scores = cosine_similarity(input_embedding, dataset_embeddings)[0]
+    similarities = cosine_similarity(query_embedding, embeddings)[0]
 
-    # Get top 5 matches
-    top_indices = scores.argsort()[-5:][::-1]
+    top_indices = np.argsort(similarities)[-5:][::-1]
 
     results = []
 
     for idx in top_indices:
         results.append({
-            "matched_text": dataset_texts[idx],
-            "similarity_score": float(scores[idx])
+            "matched_text": questions[idx],
+            "similarity_score": float(similarities[idx])
         })
 
     return {
-        "matches": results
+        "results": results
     }
