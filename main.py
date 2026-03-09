@@ -151,16 +151,3 @@ if __name__ == "__main__":
         port=port,
         log_level="info",
     )
-```
-
----
-
-### Render Configuration Changes
-
-**Start Command** (in Render dashboard → Settings):
-```
-python main.py
-```
-This is fine. Alternatively, the more production-correct form is:
-```
-uvicorn main:app --host 0.0.0.0 --port $PORT
