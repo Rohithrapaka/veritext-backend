@@ -1,7 +1,9 @@
 fastapi
-uvicorn
+gunicorn
+uvicorn[standard]
 sentence-transformers
 scikit-learn
 pandas
 numpy
-gunicorn
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
