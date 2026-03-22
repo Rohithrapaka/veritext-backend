@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 import logging
+import os
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -159,3 +161,68 @@ def plagiarism_check(input: TextInput):
             status_code=500,
             detail="Plagiarism analysis failed"
         )
+
+
+# -----------------------------
+# AI Detection Endpoint  ← CHANGED
+# -----------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+class AIInput(BaseModel):
+    text: str
+
+@app.post("/api/ai-detect")
+def ai_detect(input: AIInput):
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing Gemini API key")
+
+    sentences = [
+        s.strip() + "."
+        for s in input.text.split(".")
+        if len(s.strip()) > 5
+    ]
+
+    if not sentences:
+        return {"overall": 0, "sentences": []}
+
+    prompt = f"""You are an AI content detector. Analyze each sentence and estimate the probability (0-100) that it was written by an AI language model.
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"overall":50,"sentences":[{{"text":"...","probability":50}}]}}
+
+Sentences:
+{chr(10).join(f"{i+1}. {s}" for i, s in enumerate(sentences))}"""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.1}
+            },
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Gemini API failed")
+
+        data = response.json()
+
+        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        clean = raw.replace("```json", "").replace("```", "").strip()
+
+        import json
+        parsed = json.loads(clean)
+
+        return {
+            "overall": parsed.get("overall", 0),
+            "sentences": parsed.get("sentences", [])
+        }
+
+    except Exception as e:
+        logger.error(f"AI detection error: {e}")
+        raise HTTPException(status_code=500, detail="AI detection failed")
