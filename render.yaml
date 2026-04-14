@@ -10,7 +10,5 @@ services:
         value: 10000
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: GEMINI_API_KEY
-        value: <GEMINI_API_KEY>
       - key: GROK_API_KEY
         value: <GROK_API_KEY>

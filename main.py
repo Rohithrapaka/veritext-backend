@@ -214,19 +214,23 @@ def ai_detect(input: AIInput):
 
         prompt = f"""You are an AI content detector. Analyze each sentence and estimate the probability (0-100) that it was written by an AI language model.
 
-CRITICAL INSTRUCTIONS:
-- Be EXTREMELY conservative in your assessment
-- Only label text as AI-generated if you have VERY strong evidence
-- Human-written text often contains natural variations, imperfections, typos, and personal style
-- Short, simple sentences are usually human-written
-- Gibberish or random text should score very low (0-20)
-- Normal conversational language should score low (0-30)
-- Only score high (70+) for text that shows clear AI patterns like:
-  * Perfect grammar with no personality
-  * Repetitive sentence structures
-  * Unnatural formality in casual contexts
-  * Generic corporate speak
-  * Overly polished academic writing without errors
+CRITICAL INSTRUCTIONS - BE EXTREMELY CONSERVATIVE:
+- Most text should score LOW (0-40) unless you have definitive proof it's AI-generated
+- Human-written text: typos, casual language, personal anecdotes = LOW score
+- Short sentences, simple language, conversational tone = LOW score  
+- Gibberish, random text, lorem ipsum = VERY LOW score (0-20)
+- Only score HIGH (70+) for text with CLEAR AI characteristics:
+  * Perfect, unnatural grammar with no personality
+  * Repetitive formal structures in casual contexts
+  * Generic marketing/sales language
+  * Overly polished academic writing without any human touch
+  * Text that sounds like it was written by a corporate AI assistant
+
+EXAMPLES:
+- "I went to store yesterday" = 15% (casual, imperfect)
+- "The weather is nice today" = 10% (simple, human-like)
+- "asdf jkl qwerty" = 5% (gibberish)
+- "This product leverages cutting-edge technology to deliver unparalleled performance" = 85% (corporate AI speak)
 
 Return ONLY valid JSON with no markdown, no backticks, no explanation:
 {{"overall":50,"sentences":[{{"text":"...","probability":50}}]}}
