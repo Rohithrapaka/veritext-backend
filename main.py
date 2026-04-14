@@ -323,8 +323,20 @@ Text to classify:
             
             # Parse JSON
             parsed = json.loads(clean)
-            score = float(parsed.get("ai_probability", 0.5))
-            # Clamp to 0-1
+            raw_score = parsed.get("ai_probability", 0.5)
+            
+            if isinstance(raw_score, str):
+                raw_score = raw_score.strip()
+                try:
+                    raw_score = float(raw_score)
+                except ValueError:
+                    raw_score = 0.5
+
+            score = float(raw_score)
+            if score > 1.0:
+                # Normalize percentage-style responses back to 0-1
+                score = score / 100.0
+
             score = max(0.0, min(1.0, score))
             
             logger.info(f"Grok AI score: {score}")
@@ -412,8 +424,9 @@ def ai_detect(input: AIInput):
         text = input.text.strip()
         if not text:
             return {
-                "label": "Error",
-                "score": 0,
+                "label": "Uncertain",
+                "score": 0.5,
+                "confidence": "low",
                 "message": "Empty text provided",
                 "details": {},
                 "sentences": []
@@ -492,8 +505,9 @@ def ai_detect(input: AIInput):
     except Exception as e:
         logger.error(f"AI detection error: {e}", exc_info=True)
         return {
-            "label": "Error",
-            "score": 0,
+            "label": "Uncertain",
+            "score": 0.5,
+            "confidence": "low",
             "message": f"Detection failed: {str(e)[:100]}",
             "details": {},
             "sentences": []
