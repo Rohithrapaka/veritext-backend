@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # API Keys
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
 
 # Rate limit configuration
 MAX_RETRIES = 3
@@ -39,24 +39,34 @@ class AIInput(BaseModel):
     text: str
 
 
-def call_gemini_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dict:
+def call_grok_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dict:
     """
-    Call Gemini API with exponential backoff retry on rate limits.
+    Call Grok API with exponential backoff retry on rate limits.
     Handles 429 (rate limit), 500 (server error), and connection errors.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Content-Type": "application/json"
+    }
     
     retry_delay = INITIAL_RETRY_DELAY
     
     for attempt in range(max_retries):
         try:
-            logger.info(f"API call attempt {attempt + 1}/{max_retries}")
+            logger.info(f"Grok API call attempt {attempt + 1}/{max_retries}")
             
             response = requests.post(
                 url,
+                headers=headers,
                 json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.1}
+                    "model": "grok-beta",
+                    "messages": [
+                        {"role": "system", "content": "You are a neutral AI content detector. Be conservative - only label text as AI-generated if you are highly confident. Random, incoherent, or poorly written text is likely human-written."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 500
                 },
                 timeout=20
             )
@@ -82,7 +92,7 @@ def call_gemini_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> d
                     retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                     continue
                 else:
-                    raise HTTPException(status_code=response.status_code, detail="Gemini API server error")
+                    raise HTTPException(status_code=response.status_code, detail="Grok API server error")
             
             # Success
             if response.status_code == 200:
@@ -90,7 +100,7 @@ def call_gemini_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> d
             
             # Other errors
             if response.status_code != 200:
-                raise HTTPException(status_code=500, detail=f"Gemini API error: {response.status_code}")
+                raise HTTPException(status_code=500, detail=f"Grok API error: {response.status_code}")
         
         except requests.exceptions.Timeout:
             logger.warning(f"Request timeout. Waiting {retry_delay}s before retry...")
@@ -98,7 +108,7 @@ def call_gemini_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> d
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                 continue
-            raise HTTPException(status_code=504, detail="Gemini API request timed out after multiple retries")
+            raise HTTPException(status_code=504, detail="Grok API request timed out after multiple retries")
         
         except requests.exceptions.ConnectionError:
             logger.warning(f"Connection error. Waiting {retry_delay}s before retry...")
@@ -106,9 +116,9 @@ def call_gemini_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> d
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                 continue
-            raise HTTPException(status_code=503, detail="Cannot reach Gemini API. Please try again later.")
+            raise HTTPException(status_code=503, detail="Cannot reach Grok API. Please try again later.")
     
-    raise HTTPException(status_code=500, detail="Failed to get response from Gemini API after retries")
+    raise HTTPException(status_code=500, detail="Failed to get response from Grok API after retries")
 
 
 # -----------
@@ -136,12 +146,12 @@ def health():
 @app.post("/api/plagiarism-check")
 def plagiarism_check(input: TextInput):
     """
-    Analyze text for plagiarism using Gemini API.
+    Analyze text for plagiarism risk using Grok API.
     Returns similarity analysis and potential plagiarism indicators.
     Handles rate limiting with automatic retries.
     """
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing Gemini API key")
+    if not GROK_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing Grok API key")
 
     try:
         # Limit text length
@@ -159,9 +169,9 @@ reasons: list of concerning patterns if any
 Text to analyze:
 {text}"""
 
-        data = call_gemini_api_with_retry(prompt)
+        data = call_grok_api_with_retry(prompt)
         
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw = data["choices"][0]["message"]["content"]
         clean = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(clean)
 
@@ -185,12 +195,12 @@ Text to analyze:
 @app.post("/api/ai-detect")
 def ai_detect(input: AIInput):
     """
-    Detect if text was generated by AI using Gemini API.
+    Detect if text was generated by AI using Grok API.
     Returns probability scores for overall text and individual sentences.
     Handles rate limiting with automatic retries.
     """
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing Gemini API key")
+    if not GROK_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing Grok API key")
 
     try:
         sentences = [
@@ -204,15 +214,17 @@ def ai_detect(input: AIInput):
 
         prompt = f"""You are an AI content detector. Analyze each sentence and estimate the probability (0-100) that it was written by an AI language model.
 
+Be conservative in your assessment. Only label text as AI-generated if you have strong evidence. Human-written text often contains natural variations, imperfections, and personal style that AI text lacks.
+
 Return ONLY valid JSON with no markdown, no backticks, no explanation:
 {{"overall":50,"sentences":[{{"text":"...","probability":50}}]}}
 
 Sentences:
 {chr(10).join(f"{i+1}. {s}" for i, s in enumerate(sentences))}"""
 
-        data = call_gemini_api_with_retry(prompt)
+        data = call_grok_api_with_retry(prompt)
         
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw = data["choices"][0]["message"]["content"]
         clean = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(clean)
 
