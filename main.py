@@ -208,6 +208,37 @@ def call_grok_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dic
     raise HTTPException(status_code=500, detail="Failed to get response from Grok API after retries")
 
 
+def _extract_json_from_response(raw_text: str) -> dict:
+    """Safely extract JSON object from raw LLM text."""
+    if not raw_text:
+        return {}
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find the first JSON object in the text
+    first_brace = raw_text.find('{')
+    last_brace = raw_text.rfind('}')
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = raw_text[first_brace:last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: try regex-style extraction of any JSON-like content
+    match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', raw_text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
 # -----------
 # Health Check
 # -----------
@@ -284,17 +315,17 @@ def _get_cache_key(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-def _call_grok_for_ai_detection(text: str) -> Tuple[float, bool]:
+def _call_grok_for_ai_detection(text: str) -> Tuple[float, bool, Optional[str]]:
     """
     Call Grok API to get AI detection score.
-    Returns: (score 0-1, success_bool)
+    Returns: (score 0-1, success_bool, model_label)
     """
     # Limit text length for API stability
     text_limited = text[:2000]
     
     prompt = f"""You are a neutral AI text classifier. Analyze this text and return ONLY a JSON object with no markdown, no backticks, no explanation.
 
-Return format: {{"ai_probability": <number between 0 and 1>, "reasoning": "<brief reason>"}}
+Return format: {{"ai_probability": <number between 0 and 1>, "label": "AI|Human|Uncertain", "reasoning": "<brief reason>"}}
 
 Rules:
 - Do NOT assume text is AI-generated
@@ -312,49 +343,48 @@ Text to classify:
     
     try:
         data = call_grok_api_with_retry(prompt, max_retries=2)
-        
-        # Parse response - handle potential format issues
-        try:
-            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            logger.info(f"RAW RESPONSE from Grok: {raw_content[:200]}")
-            
-            # Clean up response
-            clean = raw_content.replace("```json", "").replace("```", "").strip()
-            
-            # Parse JSON
-            parsed = json.loads(clean)
-            raw_score = parsed.get("ai_probability", 0.5)
-            
-            if isinstance(raw_score, str):
-                raw_score = raw_score.strip()
-                try:
-                    raw_score = float(raw_score)
-                except ValueError:
-                    raw_score = 0.5
 
-            score = float(raw_score)
-            if score > 1.0:
-                # Normalize percentage-style responses back to 0-1
-                score = score / 100.0
+        raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.info("RAW MODEL RESPONSE: %s", raw_content[:1000])
 
-            score = max(0.0, min(1.0, score))
-            
-            logger.info(f"Grok AI score: {score}")
-            return score, True
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}, raw: {raw_content[:100]}")
-            return 0.5, False
-        except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Value extraction error: {e}")
-            return 0.5, False
-            
+        clean = raw_content.replace("```json", "").replace("```", "").strip()
+        parsed = _extract_json_from_response(clean)
+
+        if not parsed:
+            logger.error("Parsed response is empty or malformed. Raw: %s", raw_content[:1000])
+            return 0.5, False, None
+
+        logger.info("PARSED MODEL RESPONSE: %s", parsed)
+
+        raw_score = parsed.get("ai_probability", 0.5)
+        raw_label = parsed.get("label", "Uncertain")
+
+        if isinstance(raw_score, str):
+            raw_score = raw_score.strip().replace("%", "")
+            try:
+                raw_score = float(raw_score)
+            except ValueError:
+                logger.error("Invalid ai_probability format: %s", raw_score)
+                raw_score = 0.5
+
+        score = float(raw_score)
+        if score > 1.0:
+            score = score / 100.0
+
+        score = max(0.0, min(1.0, score))
+        if isinstance(raw_label, str):
+            raw_label = raw_label.strip()
+
+        logger.info("Normalized AI score: %s, model label: %s", score, raw_label)
+
+        return score, True, raw_label
+
     except HTTPException as e:
-        logger.warning(f"API error (will use heuristics only): {e}")
-        return 0.5, False
+        logger.warning("API error (will use heuristics only): %s", e)
+        return 0.5, False, None
     except Exception as e:
-        logger.error(f"Unexpected error calling Grok: {e}")
-        return 0.5, False
+        logger.error("Unexpected error calling Grok: %s", e, exc_info=True)
+        return 0.5, False, None
 
 
 def _combine_signals(text: str, llm_score: float, use_llm: bool) -> Tuple[float, str, dict]:
@@ -438,11 +468,13 @@ def ai_detect(input: AIInput):
             logger.info(f"Cache hit for text (key: {cache_key[:8]}...)")
             return _detection_cache[cache_key]
         
-        # Get LLM score
-        llm_score, use_llm = _call_grok_for_ai_detection(text)
+        # Get LLM score and optional model label
+        llm_score, use_llm, model_label = _call_grok_for_ai_detection(text)
         
         # Combine with heuristics
         final_score, label, details = _combine_signals(text, llm_score, use_llm)
+        if model_label:
+            details["model_label"] = model_label
         
         # Process sentences for granular results
         sentences = [
@@ -487,6 +519,7 @@ def ai_detect(input: AIInput):
             })
         
         # Build response
+        logger.info("FINAL DETECTION RESULT: score=%s label=%s use_llm=%s", final_score, label, use_llm)
         result = {
             "label": label,
             "score": round(final_score, 2),
