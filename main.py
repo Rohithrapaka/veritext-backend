@@ -6,8 +6,10 @@ import os
 import requests
 import json
 import time
+import re
+import hashlib
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,11 +33,96 @@ MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1  # seconds
 MAX_RETRY_DELAY = 10  # seconds
 
-class TextInput(BaseModel):
-    text: str
+# Detection cache to avoid repeated API calls
+_detection_cache: Dict[str, dict] = {}
+
+# =========================================
+# HEURISTIC FUNCTIONS FOR AI DETECTION
+# =========================================
+
+def is_gibberish(text: str) -> float:
+    """
+    Detect if text is gibberish/nonsensical.
+    Returns score 0-1 (1 = definitely gibberish).
+    """
+    if not text or len(text.split()) < 2:
+        return 0
+    
+    words = text.split()
+    # Count words that don't match basic letter patterns
+    nonsense_count = 0
+    for w in words:
+        # Remove punctuation
+        clean = re.sub(r'[^a-zA-Z0-9]', '', w)
+        # Check if it looks like a word (contains vowels or common patterns)
+        if clean and not re.search(r'[aeiouAEIOU]', clean) and len(clean) > 3:
+            nonsense_count += 1
+    
+    gibberish_ratio = nonsense_count / len(words) if words else 0
+    return min(1.0, gibberish_ratio)
+
+
+def repetition_score(text: str) -> float:
+    """
+    Measure repetition patterns. AI text tends to repeat structure.
+    Returns score 0-1 (1 = high repetition).
+    """
+    if not text:
+        return 0
+    
+    words = text.lower().split()
+    if len(words) < 5:
+        return 0
+    
+    # Count unique words vs total
+    unique_ratio = len(set(words)) / len(words)
+    # High repetition (low unique ratio) = potentially AI
+    repetition = 1.0 - unique_ratio
+    return min(1.0, repetition * 1.5)  # Scale up slightly
+
+
+def structure_score(text: str) -> float:
+    """
+    Measure text structure. Perfect structure = potentially AI.
+    Returns score 0-1 (1 = very structured/AI-like).
+    """
+    lines = text.split('\n')
+    sentences = re.split(r'[.!?]+', text)
+    
+    # Check for very consistent sentence lengths (AI trait)
+    lengths = [len(s.split()) for s in sentences if s.strip()]
+    if len(lengths) < 2:
+        return 0
+    
+    avg_len = sum(lengths) / len(lengths)
+    variance = sum((l - avg_len) ** 2 for l in lengths) / len(lengths)
+    
+    # Low variance = potentially AI (score close to 1)
+    # High variance = likely human (score close to 0)
+    structure = 1.0 / (1.0 + variance)  # Normalize with sigmoid-like function
+    
+    return structure
+
+
+def text_length_heuristic(text: str) -> float:
+    """
+    Very short text is likely human.
+    Returns signal 0-1 (1 = potentially AI).
+    """
+    word_count = len(text.split())
+    if word_count < 10:
+        return 0.1  # Short text = likely human
+    elif word_count < 50:
+        return 0.2
+    else:
+        return 0.3  # Longer text slightly more likely to be AI
 
 
 class AIInput(BaseModel):
+    text: str
+
+
+class TextInput(BaseModel):
     text: str
 
 
@@ -62,10 +149,10 @@ def call_grok_api_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dic
                 json={
                     "model": "grok-beta",
                     "messages": [
-                        {"role": "system", "content": "You are a neutral AI content detector. Be conservative - only label text as AI-generated if you are highly confident. Random, incoherent, or poorly written text is likely human-written."},
+                        {"role": "system", "content": "You are a neutral AI text classifier. Return ONLY valid JSON with no explanation or markdown. Be conservative - do NOT assume text is AI-generated. Random, messy, or incoherent text is likely human. Only score high if you are highly confident."},
                         {"role": "user", "content": prompt}
                     ],
-                    "temperature": 0.1,
+                    "temperature": 0.3,
                     "max_tokens": 500
                 },
                 timeout=20
@@ -192,65 +279,222 @@ Text to analyze:
 # AI Detection Endpoint (with retry)
 # -----------
 
+def _get_cache_key(text: str) -> str:
+    """Generate cache key from text hash."""
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def _call_grok_for_ai_detection(text: str) -> Tuple[float, bool]:
+    """
+    Call Grok API to get AI detection score.
+    Returns: (score 0-1, success_bool)
+    """
+    # Limit text length for API stability
+    text_limited = text[:2000]
+    
+    prompt = f"""You are a neutral AI text classifier. Analyze this text and return ONLY a JSON object with no markdown, no backticks, no explanation.
+
+Return format: {{"ai_probability": <number between 0 and 1>, "reasoning": "<brief reason>"}}
+
+Rules:
+- Do NOT assume text is AI-generated
+- Random, messy, or incoherent text is likely HUMAN (score: 0-0.3)
+- Normal conversational text with typos/casual language = HUMAN (score: 0-0.4)  
+- Simple, short text = HUMAN (score: 0-0.3)
+- Only score HIGH (>0.7) if you see CLEAR AI patterns:
+  * Perfectly polished academic writing with zero errors
+  * Repetitive structure and formal tone in casual contexts
+  * Generic corporate/marketing language with buzzwords
+  * Text that sounds like a typical AI assistant output
+
+Text to classify:
+{text_limited}"""
+    
+    try:
+        data = call_grok_api_with_retry(prompt, max_retries=2)
+        
+        # Parse response - handle potential format issues
+        try:
+            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            logger.info(f"RAW RESPONSE from Grok: {raw_content[:200]}")
+            
+            # Clean up response
+            clean = raw_content.replace("```json", "").replace("```", "").strip()
+            
+            # Parse JSON
+            parsed = json.loads(clean)
+            score = float(parsed.get("ai_probability", 0.5))
+            # Clamp to 0-1
+            score = max(0.0, min(1.0, score))
+            
+            logger.info(f"Grok AI score: {score}")
+            return score, True
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}, raw: {raw_content[:100]}")
+            return 0.5, False
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Value extraction error: {e}")
+            return 0.5, False
+            
+    except HTTPException as e:
+        logger.warning(f"API error (will use heuristics only): {e}")
+        return 0.5, False
+    except Exception as e:
+        logger.error(f"Unexpected error calling Grok: {e}")
+        return 0.5, False
+
+
+def _combine_signals(text: str, llm_score: float, use_llm: bool) -> Tuple[float, str, dict]:
+    """
+    Combine multiple signals for final AI detection score.
+    Returns: (final_score 0-1, label "AI"/"Uncertain"/"Human", details)
+    """
+    # Calculate heuristic scores
+    gibberish = is_gibberish(text)
+    repetition = repetition_score(text)
+    structure = structure_score(text)
+    length = text_length_heuristic(text)
+    
+    details = {
+        "llm_score": llm_score,
+        "gibberish": round(gibberish, 2),
+        "repetition": round(repetition, 2),
+        "structure": round(structure, 2),
+        "length_signal": round(length, 2),
+    }
+    
+    # If text is gibberish, definitely human
+    if gibberish > 0.5:
+        logger.info(f"Detected gibberish (score: {gibberish})")
+        return 0.1, "Human", {**details, "reason": "Gibberish detected"}
+    
+    # Combine signals with weights
+    if use_llm:
+        # LLM is the main signal, heuristics provide context
+        final_score = (
+            0.70 * llm_score +           # LLM is primary
+            0.10 * repetition +          # AI tends to repeat
+            0.10 * structure +           # AI has structured patterns
+            0.10 * length                # Very short = usually human
+        )
+    else:
+        # Without LLM, rely on heuristics
+        final_score = (
+            0.30 * repetition +
+            0.30 * structure +
+            0.25 * length +
+            0.15 * gibberish
+        )
+    
+    # Determine label based on final score
+    if final_score > 0.85:
+        label = "AI"
+    elif final_score > 0.60:
+        label = "Uncertain"
+    else:
+        label = "Human"
+    
+    return final_score, label, details
+
+
 @app.post("/api/ai-detect")
 def ai_detect(input: AIInput):
     """
-    Detect if text was generated by AI using Grok API.
-    Returns probability scores for overall text and individual sentences.
-    Handles rate limiting with automatic retries.
+    Detect if text was generated by AI.
+    Uses hybrid detection: Grok LLM + heuristics.
+    Returns: {label: "AI"/"Uncertain"/"Human", score: 0-1, details: {...}, sentences: [...]}
     """
     if not GROK_API_KEY:
         raise HTTPException(status_code=500, detail="Missing Grok API key")
 
     try:
+        text = input.text.strip()
+        if not text:
+            return {
+                "label": "Error",
+                "score": 0,
+                "message": "Empty text provided",
+                "details": {},
+                "sentences": []
+            }
+        
+        # Check cache first
+        cache_key = _get_cache_key(text)
+        if cache_key in _detection_cache:
+            logger.info(f"Cache hit for text (key: {cache_key[:8]}...)")
+            return _detection_cache[cache_key]
+        
+        # Get LLM score
+        llm_score, use_llm = _call_grok_for_ai_detection(text)
+        
+        # Combine with heuristics
+        final_score, label, details = _combine_signals(text, llm_score, use_llm)
+        
+        # Process sentences for granular results
         sentences = [
             s.strip() + "."
-            for s in input.text.split(".")
+            for s in text.split(".")
             if len(s.strip()) > 5
         ]
-
-        if not sentences:
-            return {"overall": 0, "sentences": []}
-
-        prompt = f"""You are an AI content detector. Analyze each sentence and estimate the probability (0-100) that it was written by an AI language model.
-
-CRITICAL INSTRUCTIONS - BE EXTREMELY CONSERVATIVE:
-- Most text should score LOW (0-40) unless you have definitive proof it's AI-generated
-- Human-written text: typos, casual language, personal anecdotes = LOW score
-- Short sentences, simple language, conversational tone = LOW score  
-- Gibberish, random text, lorem ipsum = VERY LOW score (0-20)
-- Only score HIGH (70+) for text with CLEAR AI characteristics:
-  * Perfect, unnatural grammar with no personality
-  * Repetitive formal structures in casual contexts
-  * Generic marketing/sales language
-  * Overly polished academic writing without any human touch
-  * Text that sounds like it was written by a corporate AI assistant
-
-EXAMPLES:
-- "I went to store yesterday" = 15% (casual, imperfect)
-- "The weather is nice today" = 10% (simple, human-like)
-- "asdf jkl qwerty" = 5% (gibberish)
-- "This product leverages cutting-edge technology to deliver unparalleled performance" = 85% (corporate AI speak)
-
-Return ONLY valid JSON with no markdown, no backticks, no explanation:
-{{"overall":50,"sentences":[{{"text":"...","probability":50}}]}}
-
-Sentences:
-{chr(10).join(f"{i+1}. {s}" for i, s in enumerate(sentences))}"""
-
-        data = call_grok_api_with_retry(prompt)
         
-        raw = data["choices"][0]["message"]["content"]
-        clean = raw.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(clean)
-
-        return {
-            "overall": parsed.get("overall", 0),
-            "sentences": parsed.get("sentences", [])
+        sentence_results = []
+        for sent in sentences:
+            # Use heuristics for individual sentences (no extra API calls)
+            sent_gibberish = is_gibberish(sent)
+            sent_repetition = repetition_score(sent)
+            sent_structure = structure_score(sent)
+            
+            # Simple heuristic score for sentences
+            if sent_gibberish > 0.5:
+                sent_score = 0.1
+            else:
+                sent_score = (
+                    0.4 * sent_structure +
+                    0.3 * sent_repetition +
+                    0.3 * sent_gibberish
+                )
+            
+            # Determine label for sentence
+            if sent_score > 0.75:
+                sent_label = "AI"
+                suspicious = True
+            elif sent_score > 0.55:
+                sent_label = "Uncertain"
+                suspicious = True
+            else:
+                sent_label = "Human"
+                suspicious = False
+            
+            sentence_results.append({
+                "text": sent,
+                "probability": round(sent_score, 2),
+                "label": sent_label,
+                "suspicious": suspicious
+            })
+        
+        # Build response
+        result = {
+            "label": label,
+            "score": round(final_score, 2),
+            "confidence": "high" if (final_score > 0.85 or final_score < 0.15) else "medium" if (final_score > 0.60 or final_score < 0.40) else "low",
+            "details": details,
+            "sentences": sentence_results
         }
+        
+        # Cache result
+        _detection_cache[cache_key] = result
+        
+        return result
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"AI detection error: {e}")
-        raise HTTPException(status_code=500, detail="AI detection failed")
+        logger.error(f"AI detection error: {e}", exc_info=True)
+        return {
+            "label": "Error",
+            "score": 0,
+            "message": f"Detection failed: {str(e)[:100]}",
+            "details": {},
+            "sentences": []
+        }
