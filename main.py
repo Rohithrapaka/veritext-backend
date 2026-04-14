@@ -239,6 +239,48 @@ def _extract_json_from_response(raw_text: str) -> dict:
     return {}
 
 
+def _parse_model_score_and_label(parsed: dict, raw_text: str) -> Tuple[Optional[float], Optional[str]]:
+    """Extract score and label from parsed model JSON or raw text."""
+    score = None
+    label = None
+
+    if parsed:
+        for key in ("ai_probability", "ai_score", "score", "probability"):
+            if key in parsed:
+                score = parsed.get(key)
+                break
+
+        label = parsed.get("label") or parsed.get("classification")
+
+    if isinstance(score, str):
+        score = score.strip().replace("%", "")
+        try:
+            score = float(score)
+        except ValueError:
+            score = None
+
+    if isinstance(score, (int, float)):
+        score = float(score)
+        if score > 1.0:
+            score = score / 100.0
+        score = max(0.0, min(1.0, score))
+    else:
+        score = None
+
+    if isinstance(label, str):
+        label = label.strip()
+        if label.lower() in ("ai", "human", "uncertain"):
+            label = label.capitalize()
+        else:
+            label = None
+
+    if not label:
+        match = re.search(r"\b(AI|Human|Uncertain)\b", raw_text, re.IGNORECASE)
+        if match:
+            label = match.group(1).capitalize()
+
+    return score, label
+
 # -----------
 # Health Check
 # -----------
@@ -356,24 +398,13 @@ Text to classify:
 
         logger.info("PARSED MODEL RESPONSE: %s", parsed)
 
-        raw_score = parsed.get("ai_probability", 0.5)
-        raw_label = parsed.get("label", "Uncertain")
+        score, raw_label = _parse_model_score_and_label(parsed, raw_content)
+        if score is None:
+            logger.error("No valid ai_probability found in parsed response. Parsed: %s", parsed)
+            return 0.5, False, raw_label
 
-        if isinstance(raw_score, str):
-            raw_score = raw_score.strip().replace("%", "")
-            try:
-                raw_score = float(raw_score)
-            except ValueError:
-                logger.error("Invalid ai_probability format: %s", raw_score)
-                raw_score = 0.5
-
-        score = float(raw_score)
-        if score > 1.0:
-            score = score / 100.0
-
-        score = max(0.0, min(1.0, score))
-        if isinstance(raw_label, str):
-            raw_label = raw_label.strip()
+        if not raw_label:
+            raw_label = "Uncertain"
 
         logger.info("Normalized AI score: %s, model label: %s", score, raw_label)
 
